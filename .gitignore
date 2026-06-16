@@ -1,0 +1,29 @@
+# Build outputs
+build_*/
+*.so
+*.bin
+*.zip
+release_assets/
+
+# Flutter
+.dart_tool/
+.packages
+pubspec.lock
+.flutter-plugins
+.flutter-plugins-dependencies
+
+# Android
+*.iml
+.gradle/
+local.properties
+.idea/
+*.keystore
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+Makefile
+cmake_install.cmake
+
+# macOS
+.DS_Store

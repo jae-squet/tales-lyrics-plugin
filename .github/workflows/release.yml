@@ -1,0 +1,110 @@
+name: Build & Release Lyrics Plugin
+
+on:
+  push:
+    tags:
+      - 'lyrics-plugin-v*'      # e.g. lyrics-plugin-v1.0.0
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. lyrics-plugin-v1.0.0)'
+        required: true
+
+jobs:
+  # ── Build native .so for each ABI ─────────────────────────────────────────
+  build-native:
+    name: Build libwhisper_jni.so (${{ matrix.abi }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        abi: [arm64-v8a, x86_64]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive    # pulls vendor/whisper.cpp
+
+      - name: Set up NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r25c
+
+      - name: Download Whisper base model weights
+        run: |
+          mkdir -p release_assets
+          curl -L -o release_assets/ggml-base.bin \
+            https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin
+
+      - name: Build .so for ${{ matrix.abi }}
+        run: |
+          cmake -B build_${{ matrix.abi }} \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=${{ matrix.abi }} \
+            -DANDROID_PLATFORM=android-26 \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build_${{ matrix.abi }} --target whisper_jni -j$(nproc)
+          cp build_${{ matrix.abi }}/libwhisper_jni.so release_assets/libwhisper_jni.so
+
+      - name: Write plugin_manifest.json
+        run: |
+          TAG=${{ github.ref_name || github.event.inputs.tag }}
+          VERSION=${TAG#lyrics-plugin-v}
+          echo '{
+            "version": "'"$VERSION"'",
+            "model": "base",
+            "abi": "${{ matrix.abi }}"
+          }' > release_assets/plugin_manifest.json
+
+      - name: Package zip
+        run: |
+          cd release_assets
+          zip ../lyrics_plugin_v1_${{ matrix.abi == 'arm64-v8a' && 'arm64' || 'x86_64' }}.zip \
+            libwhisper_jni.so ggml-base.bin plugin_manifest.json
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-zip-${{ matrix.abi }}
+          path: lyrics_plugin_v1_*.zip
+
+  # ── Create GitHub Release ──────────────────────────────────────────────────
+  release:
+    name: Create GitHub Release
+    needs: build-native
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all zip artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: zips
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name || github.event.inputs.tag }}
+          name: Lyrics Plugin ${{ github.ref_name || github.event.inputs.tag }}
+          body: |
+            ## Lyrics Plugin Release
+
+            Offline Whisper lyrics plugin for Tales music player.
+
+            ### Files
+            | File | ABI | Size |
+            |------|-----|------|
+            | `lyrics_plugin_v1_arm64.zip` | arm64-v8a | ~147 MB |
+            | `lyrics_plugin_v1_x86_64.zip` | x86_64 | ~147 MB |
+
+            ### What's included
+            - `libwhisper_jni.so` — native JNI bridge (~5 MB)
+            - `ggml-base.bin` — Whisper base model weights (~142 MB)
+            - `plugin_manifest.json` — version metadata
+
+            ### Installation
+            These files are downloaded automatically by the app when the user enables lyrics.
+          files: zips/*.zip
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
