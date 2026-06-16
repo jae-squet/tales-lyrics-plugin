@@ -21,8 +21,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive    # pulls vendor/whisper.cpp
+
+      - name: Clone whisper.cpp
+        run: git clone --depth 1 https://github.com/ggerganov/whisper.cpp vendor/whisper.cpp
 
       - name: Set up NDK
         uses: nttld/setup-ndk@v1
