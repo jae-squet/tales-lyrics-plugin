@@ -1,14 +1,12 @@
 cmake_minimum_required(VERSION 3.22)
 project(whisper_jni VERSION 1.0.0)
 
-# ── whisper.cpp ──────────────────────────────────────────────────────────────
 add_subdirectory(vendor/whisper.cpp whisper_build EXCLUDE_FROM_ALL)
 
-# ── JNI bridge ───────────────────────────────────────────────────────────────
 add_library(
     whisper_jni
     SHARED
-    android/src/main/kotlin/com/squet/talesplayer/lyrics/whisper/whisper_jni.cpp
+    native/whisper_jni.cpp
 )
 
 target_include_directories(whisper_jni PRIVATE
