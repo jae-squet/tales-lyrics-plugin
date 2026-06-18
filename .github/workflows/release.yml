@@ -23,11 +23,21 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Clone whisper.cpp v1.7.3
-        # v1.7.3 is the version that produces all 4 required libraries:
-        # libggml-base.so, libggml-cpu.so, libggml.so, libwhisper.so
         run: |
           git clone --depth 1 --branch v1.7.3 \
             https://github.com/ggerganov/whisper.cpp vendor/whisper.cpp
+
+      # FIX: Download dr_libs header-only audio decoders so whisper_jni.cpp
+      # can decode WAV / MP3 / FLAC without depending on ffmpeg or MediaCodec.
+      - name: Download dr_libs headers
+        run: |
+          mkdir -p native
+          curl -L -o native/dr_wav.h  \
+            https://raw.githubusercontent.com/mackron/dr_libs/master/dr_wav.h
+          curl -L -o native/dr_mp3.h  \
+            https://raw.githubusercontent.com/mackron/dr_libs/master/dr_mp3.h
+          curl -L -o native/dr_flac.h \
+            https://raw.githubusercontent.com/mackron/dr_libs/master/dr_flac.h
 
       - name: Set up NDK
         uses: nttld/setup-ndk@v1
@@ -40,7 +50,12 @@ jobs:
           curl -L -o release_assets/ggml-base.bin \
             https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin
 
-      - name: Build ALL .so files for ${{ matrix.abi }}
+      # ── Step 1: Build the ggml + whisper stack ─────────────────────────────
+      # FIX 1: Add -DGGML_OPENMP=OFF to prevent libggml-cpu.so from depending
+      # on libomp.so, which is NOT a standard Android system library and will
+      # cause a dlopen crash at runtime:
+      #   UnsatisfiedLinkError: library "libomp.so" not found
+      - name: Build whisper.cpp shared libs for ${{ matrix.abi }}
         run: |
           cmake -S vendor/whisper.cpp -B build_${{ matrix.abi }} \
             -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
@@ -48,13 +63,14 @@ jobs:
             -DANDROID_PLATFORM=android-26 \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=ON \
+            -DGGML_OPENMP=OFF \
             -DWHISPER_BUILD_TESTS=OFF \
             -DWHISPER_BUILD_EXAMPLES=OFF
           cmake --build build_${{ matrix.abi }} -j$(nproc)
           echo "All built .so files:"
           find build_${{ matrix.abi }} -name "*.so" | sort
 
-      - name: Collect all required .so files
+      - name: Collect whisper stack .so files
         run: |
           REQUIRED="libggml-base.so libggml-cpu.so libggml.so libwhisper.so"
           ALL_FOUND=true
@@ -69,24 +85,70 @@ jobs:
             fi
           done
           if [ "$ALL_FOUND" = false ]; then
-            echo ""
             echo "Full build output:"
             find build_${{ matrix.abi }} -name "*.so" | sort
             exit 1
           fi
 
-      - name: Copy libwhisper_jni.so
+      # ── Step 2: Build libwhisper_jni.so from source ────────────────────────
+      # FIX 2: The pre-built libwhisper_jni.so exported JNI symbols for package
+      # com.squet.talesplayer.lyrics.whisper.WhisperPlugin, but WhisperPlugin.kt
+      # lives in com.squet.talesplayer.  Android's JNI name-mangling derives
+      # the symbol name from the Kotlin class's fully-qualified package, so the
+      # two must match exactly.  The pre-built binary was therefore unusable —
+      # every native call would throw:
+      #   UnsatisfiedLinkError: No implementation found for nativeInit
+      #
+      # Solution: build libwhisper_jni.so from our own source (native/whisper_jni.cpp)
+      # which uses the correct package name in its Java_* symbol names.
+      # The whisper + ggml .so files built above are declared as runtime-loaded
+      # imports (-Wl,--allow-shlib-undefined) so they are NOT statically linked
+      # into libwhisper_jni.so — they remain separate files in the pack bundle
+      # and are loaded first by WhisperPlugin.kt via System.load().
+      - name: Build libwhisper_jni.so for ${{ matrix.abi }}
         run: |
-          # Use the pre-built libwhisper_jni.so committed to the repo root
-          if [ -f "libwhisper_jni.so" ]; then
-            echo "Using pre-built libwhisper_jni.so from repo root"
-            cp libwhisper_jni.so release_assets/libwhisper_jni.so
-          else
-            echo "ERROR: libwhisper_jni.so not found in repo root!"
-            echo "Please commit your libwhisper_jni.so to the root of this repo."
+          # Expose whisper.cpp headers to the JNI build
+          cmake -S . -B build_jni_${{ matrix.abi }} \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=${{ matrix.abi }} \
+            -DANDROID_PLATFORM=android-26 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON
+          cmake --build build_jni_${{ matrix.abi }} -j$(nproc)
+          JNI_SO=$(find build_jni_${{ matrix.abi }} -name "libwhisper_jni.so" | head -1)
+          if [ -z "$JNI_SO" ]; then
+            echo "ERROR: libwhisper_jni.so not produced by JNI build!"
             exit 1
           fi
-          echo "libwhisper_jni.so size: $(du -h release_assets/libwhisper_jni.so | cut -f1)"
+          echo "libwhisper_jni.so: $(du -h $JNI_SO | cut -f1)"
+          cp "$JNI_SO" release_assets/libwhisper_jni.so
+
+      # ── Verify JNI symbol names match WhisperPlugin.kt package ────────────
+      - name: Verify JNI symbols
+        run: |
+          echo "Exported JNI symbols in libwhisper_jni.so:"
+          nm -D --defined-only release_assets/libwhisper_jni.so | grep "T Java_"
+
+          EXPECTED_PREFIX="Java_com_squet_talesplayer_WhisperPlugin_native"
+          for SYM in nativeInit nativeTranscribe nativeRelease; do
+            FULL="${EXPECTED_PREFIX}${SYM}"
+            if nm -D release_assets/libwhisper_jni.so | grep -q "$FULL"; then
+              echo "✅  $FULL found"
+            else
+              echo "❌  $FULL MISSING — package mismatch, build will fail at runtime!"
+              exit 1
+            fi
+          done
+
+      # ── Verify libggml-cpu.so has no libomp dependency ────────────────────
+      - name: Verify no libomp dependency
+        run: |
+          if readelf -d release_assets/libggml-cpu.so | grep -q "libomp.so"; then
+            echo "❌  libggml-cpu.so still depends on libomp.so — -DGGML_OPENMP=OFF did not apply!"
+            exit 1
+          else
+            echo "✅  libggml-cpu.so has no libomp.so dependency"
+          fi
 
       - name: Write plugin_manifest.json
         run: |
@@ -174,10 +236,10 @@ jobs:
             ### What's included in each zip
 
             - `libggml-base.so` — GGML base primitives
-            - `libggml-cpu.so` — GGML CPU backend
+            - `libggml-cpu.so` — GGML CPU backend (OpenMP disabled for Android compatibility)
             - `libggml.so` — GGML core
             - `libwhisper.so` — Whisper core
-            - `libwhisper_jni.so` — JNI bridge
+            - `libwhisper_jni.so` — JNI bridge (built from source, correct package)
             - `ggml-base.bin` — Whisper base model weights (~142 MB)
             - `plugin_manifest.json` — version metadata
 
