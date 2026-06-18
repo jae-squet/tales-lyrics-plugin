@@ -3,7 +3,7 @@ name: Build & Release Lyrics Plugin
 on:
   push:
     tags:
-      - 'lyrics-plugin-v*'   # e.g. lyrics-plugin-v1.0.0
+      - 'lyrics-plugin-v*'
   workflow_dispatch:
     inputs:
       tag:
@@ -11,7 +11,6 @@ on:
         required: true
 
 jobs:
-  # ── Build native .so files for each ABI ───────────────────────────────────
   build-native:
     name: Build native libs (${{ matrix.abi }})
     runs-on: ubuntu-latest
@@ -31,6 +30,13 @@ jobs:
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r25c
+
+      - name: Download dr_libs headers
+        run: |
+          mkdir -p native
+          curl -L -o native/dr_wav.h  https://raw.githubusercontent.com/mackron/dr_libs/master/dr_wav.h
+          curl -L -o native/dr_mp3.h  https://raw.githubusercontent.com/mackron/dr_libs/master/dr_mp3.h
+          curl -L -o native/dr_flac.h https://raw.githubusercontent.com/mackron/dr_libs/master/dr_flac.h
 
       - name: Download Whisper base model weights
         run: |
@@ -87,10 +93,9 @@ jobs:
 
       - name: Build libwhisper_jni.so from source (OpenMP DISABLED)
         run: |
-          # Copy pre-built libwhisper.so into the location CMakeLists expects
-          mkdir -p release_assets
-          # Already copied above — just confirm it's there
-          ls -lh release_assets/libwhisper.so
+          # Stage libwhisper.so where CMakeLists expects it
+          mkdir -p libs/${{ matrix.abi }}
+          cp release_assets/libwhisper.so libs/${{ matrix.abi }}/libwhisper.so
 
           cmake -S . -B build_jni_${{ matrix.abi }} \
             -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
