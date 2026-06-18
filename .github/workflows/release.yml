@@ -1,253 +1,40 @@
-name: Build & Release Lyrics Plugin
+cmake_minimum_required(VERSION 3.22)
+project(whisper_jni)
 
-on:
-  push:
-    tags:
-      - 'lyrics-plugin-v*'   # e.g. lyrics-plugin-v1.0.0
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Release tag (e.g. lyrics-plugin-v1.0.0)'
-        required: true
+# ── whisper_jni.so — built from our JNI source only ───────────────────────────
+#
+# libwhisper.so and the ggml stack are built separately by the parent job
+# and are loaded via System.load() before this library.  We link against
+# libwhisper.so as an IMPORTED shared library so the linker can resolve all
+# whisper_* symbols at link time without bundling them inside libwhisper_jni.so.
 
-jobs:
-  # ── Build native .so files for each ABI ───────────────────────────────────
-  build-native:
-    name: Build native libs (${{ matrix.abi }})
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        abi: [arm64-v8a, x86_64]
+add_library(whisper_jni SHARED native/whisper_jni.cpp)
 
-    steps:
-      - uses: actions/checkout@v4
+# Whisper headers — vendored whisper.cpp must be checked out before this runs
+target_include_directories(whisper_jni PRIVATE
+    ${CMAKE_SOURCE_DIR}/vendor/whisper.cpp/include
+    ${CMAKE_SOURCE_DIR}/vendor/whisper.cpp/ggml/include
+    ${CMAKE_SOURCE_DIR}/native                       # dr_wav.h / dr_mp3.h / dr_flac.h
+)
 
-      - name: Clone whisper.cpp v1.7.3
-        run: |
-          git clone --depth 1 --branch v1.7.3 \
-            https://github.com/ggerganov/whisper.cpp vendor/whisper.cpp
+# ── Declare libwhisper.so as an imported shared lib ───────────────────────────
+# The parent job copies it to release_assets/ before this cmake step runs.
+add_library(whisper SHARED IMPORTED)
+set_target_properties(whisper PROPERTIES
+    IMPORTED_LOCATION ${CMAKE_SOURCE_DIR}/release_assets/libwhisper.so
+)
 
-      # FIX: Download dr_libs header-only audio decoders so whisper_jni.cpp
-      # can decode WAV / MP3 / FLAC without depending on ffmpeg or MediaCodec.
-      - name: Download dr_libs headers
-        run: |
-          mkdir -p native
-          curl -L -o native/dr_wav.h  \
-            https://raw.githubusercontent.com/mackron/dr_libs/master/dr_wav.h
-          curl -L -o native/dr_mp3.h  \
-            https://raw.githubusercontent.com/mackron/dr_libs/master/dr_mp3.h
-          curl -L -o native/dr_flac.h \
-            https://raw.githubusercontent.com/mackron/dr_libs/master/dr_flac.h
+# Android system libraries (always present in the device linker namespace)
+find_library(log-lib    log)
+find_library(android-lib android)
 
-      - name: Set up NDK
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: r25c
+target_link_libraries(whisper_jni
+    whisper          # resolves all whisper_* symbols at link time
+    ${log-lib}
+    ${android-lib}
+)
 
-      - name: Download Whisper base model weights
-        run: |
-          mkdir -p release_assets
-          curl -L -o release_assets/ggml-base.bin \
-            https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin
-
-      # ── Step 1: Build the ggml + whisper stack ─────────────────────────────
-      # FIX 1: Add -DGGML_OPENMP=OFF to prevent libggml-cpu.so from depending
-      # on libomp.so, which is NOT a standard Android system library and will
-      # cause a dlopen crash at runtime:
-      #   UnsatisfiedLinkError: library "libomp.so" not found
-      - name: Build whisper.cpp shared libs for ${{ matrix.abi }}
-        run: |
-          cmake -S vendor/whisper.cpp -B build_${{ matrix.abi }} \
-            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
-            -DANDROID_ABI=${{ matrix.abi }} \
-            -DANDROID_PLATFORM=android-26 \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_SHARED_LIBS=ON \
-            -DGGML_OPENMP=OFF \
-            -DWHISPER_BUILD_TESTS=OFF \
-            -DWHISPER_BUILD_EXAMPLES=OFF
-          cmake --build build_${{ matrix.abi }} -j$(nproc)
-          echo "All built .so files:"
-          find build_${{ matrix.abi }} -name "*.so" | sort
-
-      - name: Collect whisper stack .so files
-        run: |
-          REQUIRED="libggml-base.so libggml-cpu.so libggml.so libwhisper.so"
-          ALL_FOUND=true
-          for LIB in $REQUIRED; do
-            SO=$(find build_${{ matrix.abi }} -name "$LIB" | head -1)
-            if [ -z "$SO" ]; then
-              echo "ERROR: $LIB not found in build output!"
-              ALL_FOUND=false
-            else
-              echo "Copying $LIB from $SO ($(du -h $SO | cut -f1))"
-              cp "$SO" release_assets/$LIB
-            fi
-          done
-          if [ "$ALL_FOUND" = false ]; then
-            echo "Full build output:"
-            find build_${{ matrix.abi }} -name "*.so" | sort
-            exit 1
-          fi
-
-      # ── Step 2: Build libwhisper_jni.so from source ────────────────────────
-      # FIX 2: The pre-built libwhisper_jni.so exported JNI symbols for package
-      # com.squet.talesplayer.lyrics.whisper.WhisperPlugin, but WhisperPlugin.kt
-      # lives in com.squet.talesplayer.  Android's JNI name-mangling derives
-      # the symbol name from the Kotlin class's fully-qualified package, so the
-      # two must match exactly.  The pre-built binary was therefore unusable —
-      # every native call would throw:
-      #   UnsatisfiedLinkError: No implementation found for nativeInit
-      #
-      # Solution: build libwhisper_jni.so from our own source (native/whisper_jni.cpp)
-      # which uses the correct package name in its Java_* symbol names.
-      # The whisper + ggml .so files built above are declared as runtime-loaded
-      # imports (-Wl,--allow-shlib-undefined) so they are NOT statically linked
-      # into libwhisper_jni.so — they remain separate files in the pack bundle
-      # and are loaded first by WhisperPlugin.kt via System.load().
-      - name: Build libwhisper_jni.so for ${{ matrix.abi }}
-        run: |
-          # Expose whisper.cpp headers to the JNI build
-          cmake -S . -B build_jni_${{ matrix.abi }} \
-            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
-            -DANDROID_ABI=${{ matrix.abi }} \
-            -DANDROID_PLATFORM=android-26 \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_SHARED_LIBS=ON
-          cmake --build build_jni_${{ matrix.abi }} -j$(nproc)
-          JNI_SO=$(find build_jni_${{ matrix.abi }} -name "libwhisper_jni.so" | head -1)
-          if [ -z "$JNI_SO" ]; then
-            echo "ERROR: libwhisper_jni.so not produced by JNI build!"
-            exit 1
-          fi
-          echo "libwhisper_jni.so: $(du -h $JNI_SO | cut -f1)"
-          cp "$JNI_SO" release_assets/libwhisper_jni.so
-
-      # ── Verify JNI symbol names match WhisperPlugin.kt package ────────────
-      - name: Verify JNI symbols
-        run: |
-          echo "Exported JNI symbols in libwhisper_jni.so:"
-          nm -D --defined-only release_assets/libwhisper_jni.so | grep "T Java_"
-
-          EXPECTED_PREFIX="Java_com_squet_talesplayer_WhisperPlugin_native"
-          for SYM in nativeInit nativeTranscribe nativeRelease; do
-            FULL="${EXPECTED_PREFIX}${SYM}"
-            if nm -D release_assets/libwhisper_jni.so | grep -q "$FULL"; then
-              echo "✅  $FULL found"
-            else
-              echo "❌  $FULL MISSING — package mismatch, build will fail at runtime!"
-              exit 1
-            fi
-          done
-
-      # ── Verify libggml-cpu.so has no libomp dependency ────────────────────
-      - name: Verify no libomp dependency
-        run: |
-          if readelf -d release_assets/libggml-cpu.so | grep -q "libomp.so"; then
-            echo "❌  libggml-cpu.so still depends on libomp.so — -DGGML_OPENMP=OFF did not apply!"
-            exit 1
-          else
-            echo "✅  libggml-cpu.so has no libomp.so dependency"
-          fi
-
-      - name: Write plugin_manifest.json
-        run: |
-          TAG=${{ github.ref_name || github.event.inputs.tag }}
-          VERSION=${TAG#lyrics-plugin-v}
-          cat > release_assets/plugin_manifest.json <<EOF
-          {
-            "version": "$VERSION",
-            "model": "base",
-            "abi": "${{ matrix.abi }}",
-            "layout": "split",
-            "libs": ["libggml-base.so", "libggml-cpu.so", "libggml.so", "libwhisper.so"]
-          }
-          EOF
-          echo "Manifest:"
-          cat release_assets/plugin_manifest.json
-
-      - name: Verify all files present before zipping
-        run: |
-          echo "release_assets contents:"
-          ls -lh release_assets/
-          REQUIRED="libggml-base.so libggml-cpu.so libggml.so libwhisper.so libwhisper_jni.so ggml-base.bin plugin_manifest.json"
-          for F in $REQUIRED; do
-            if [ ! -f "release_assets/$F" ]; then
-              echo "ERROR: release_assets/$F is missing!"
-              exit 1
-            fi
-          done
-          echo "All 7 required files present."
-
-      - name: Package zip
-        run: |
-          ABI_TAG=${{ matrix.abi == 'arm64-v8a' && 'arm64' || 'x86_64' }}
-          cd release_assets
-          zip ../lyrics_plugin_v1_${ABI_TAG}.zip \
-            libggml-base.so \
-            libggml-cpu.so \
-            libggml.so \
-            libwhisper.so \
-            libwhisper_jni.so \
-            ggml-base.bin \
-            plugin_manifest.json
-          echo "Zip contents:"
-          unzip -l ../lyrics_plugin_v1_${ABI_TAG}.zip
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: plugin-zip-${{ matrix.abi }}
-          path: lyrics_plugin_v1_*.zip
-
-  # ── Create GitHub Release ──────────────────────────────────────────────────
-  release:
-    name: Create GitHub Release
-    needs: build-native
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Download all zip artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: zips
-          merge-multiple: true
-
-      - name: Verify zips
-        run: |
-          echo "Zips to release:"
-          ls -lh zips/
-          for ZIP in zips/*.zip; do
-            echo ""
-            echo "Contents of $ZIP:"
-            unzip -l "$ZIP"
-          done
-
-      - name: Create release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name || github.event.inputs.tag }}
-          name: Lyrics Plugin ${{ github.ref_name || github.event.inputs.tag }}
-          body: |
-            ## Lyrics Plugin Release
-
-            Offline Whisper lyrics plugin for Tales music player.
-
-            ### What's included in each zip
-
-            - `libggml-base.so` — GGML base primitives
-            - `libggml-cpu.so` — GGML CPU backend (OpenMP disabled for Android compatibility)
-            - `libggml.so` — GGML core
-            - `libwhisper.so` — Whisper core
-            - `libwhisper_jni.so` — JNI bridge (built from source, correct package)
-            - `ggml-base.bin` — Whisper base model weights (~142 MB)
-            - `plugin_manifest.json` — version metadata
-
-            ### Installation
-
-            Downloaded automatically by the app when the user enables lyrics.
-          files: zips/*.zip
-          draft: false
-          prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+set_target_properties(whisper_jni PROPERTIES
+    OUTPUT_NAME "whisper_jni"
+    ANDROID_STL c++_shared
+)
