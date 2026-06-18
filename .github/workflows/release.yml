@@ -1,199 +1,191 @@
-# .github/workfl ows/build-whisper.yml
-#
-# Builds all required native libraries for Android from whisper.cpp source:
-#   - libggml-base.so
-#   - libggml-cpu.so
-#   - libggml.so
-#   - libwhisper.so
-#
-# Then injects them into the existing release zips alongside libwhisper_jni.so.
-# Load order in WhisperPlugin.kt must be:
-#   libggml-base.so → libggml-cpu.so → libggml.so → libwhisper.so → libwhisper_jni.so
-
-name: Build libwhisper.so for Android
+name: Build & Release Lyrics Plugin
 
 on:
+  push:
+    tags:
+      - 'lyrics-plugin-v*'   # e.g. lyrics-plugin-v1.0.0
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to upload assets to (e.g. lyrics-plugin-v1.0.3)'
+        description: 'Release tag (e.g. lyrics-plugin-v1.0.0)'
         required: true
-        default: 'lyrics-plugin-v1.0.3'
-      whisper_ref:
-        description: 'whisper.cpp git ref to build from (tag, branch, or commit)'
-        required: true
-        default: 'v1.7.1'
 
 jobs:
-  build:
+  # ── Build native .so files for each ABI ───────────────────────────────────
+  build-native:
+    name: Build native libs (${{ matrix.abi }})
     runs-on: ubuntu-latest
     strategy:
       matrix:
         abi: [arm64-v8a, x86_64]
 
     steps:
-      - name: Checkout whisper.cpp
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+
+      - name: Clone whisper.cpp v1.7.3
+        # v1.7.3 is the version that produces all 4 required libraries:
+        # libggml-base.so, libggml-cpu.so, libggml.so, libwhisper.so
+        run: |
+          git clone --depth 1 --branch v1.7.3 \
+            https://github.com/ggerganov/whisper.cpp vendor/whisper.cpp
+
+      - name: Set up NDK
+        uses: nttld/setup-ndk@v1
         with:
-          repository: ggerganov/whisper.cpp
-          ref: ${{ github.event.inputs.whisper_ref }}
+          ndk-version: r25c
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install NDK
+      - name: Download Whisper base model weights
         run: |
-          echo "y" | sdkmanager "ndk;26.1.10909125" --sdk_root=$ANDROID_SDK_ROOT
+          mkdir -p release_assets
+          curl -L -o release_assets/ggml-base.bin \
+            https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin
 
-      - name: Configure CMake
+      - name: Build ALL .so files for ${{ matrix.abi }}
         run: |
-          mkdir build-${{ matrix.abi }}
-          cmake -S . -B build-${{ matrix.abi }} \
-            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_SDK_ROOT/ndk/26.1.10909125/build/cmake/android.toolchain.cmake \
+          cmake -S vendor/whisper.cpp -B build_${{ matrix.abi }} \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
             -DANDROID_ABI=${{ matrix.abi }} \
-            -DANDROID_PLATFORM=android-24 \
+            -DANDROID_PLATFORM=android-26 \
+            -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=ON \
             -DWHISPER_BUILD_TESTS=OFF \
-            -DWHISPER_BUILD_EXAMPLES=OFF \
-            -DCMAKE_BUILD_TYPE=Release
-
-      - name: Build
-        run: cmake --build build-${{ matrix.abi }} --config Release -j$(nproc)
-
-      - name: List all built .so files
-        run: |
-          echo "All .so files produced:"
-          find build-${{ matrix.abi }} -name "*.so" | sort
-          echo ""
-          echo "Sizes:"
-          find build-${{ matrix.abi }} -name "*.so" -exec ls -lh {} \;
+            -DWHISPER_BUILD_EXAMPLES=OFF
+          cmake --build build_${{ matrix.abi }} -j$(nproc)
+          echo "All built .so files:"
+          find build_${{ matrix.abi }} -name "*.so" | sort
 
       - name: Collect all required .so files
         run: |
           REQUIRED="libggml-base.so libggml-cpu.so libggml.so libwhisper.so"
           ALL_FOUND=true
           for LIB in $REQUIRED; do
-            SO=$(find build-${{ matrix.abi }} -name "$LIB" | head -1)
+            SO=$(find build_${{ matrix.abi }} -name "$LIB" | head -1)
             if [ -z "$SO" ]; then
               echo "ERROR: $LIB not found in build output!"
               ALL_FOUND=false
             else
-              echo "Found $LIB at $SO ($(du -h $SO | cut -f1))"
-              cp "$SO" "$LIB"
+              echo "Copying $LIB from $SO ($(du -h $SO | cut -f1))"
+              cp "$SO" release_assets/$LIB
             fi
           done
           if [ "$ALL_FOUND" = false ]; then
             echo ""
-            echo "Build output was:"
-            find build-${{ matrix.abi }} -name "*.so"
+            echo "Full build output:"
+            find build_${{ matrix.abi }} -name "*.so" | sort
             exit 1
           fi
 
-      - name: Upload all .so files as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: whisper-libs-${{ matrix.abi }}
-          path: |
-            libggml-base.so
-            libggml-cpu.so
-            libggml.so
-            libwhisper.so
-
-  repack:
-    needs: build
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        include:
-          - abi: arm64-v8a
-            tag_suffix: arm64
-          - abi: x86_64
-            tag_suffix: x86_64
-
-    steps:
-      - name: Download built .so artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: whisper-libs-${{ matrix.abi }}
-
-      - name: Verify downloaded .so files
+      - name: Copy libwhisper_jni.so
         run: |
-          echo "Downloaded libraries:"
-          ls -lh *.so
-          REQUIRED="libggml-base.so libggml-cpu.so libggml.so libwhisper.so"
-          for LIB in $REQUIRED; do
-            if [ ! -f "$LIB" ]; then
-              echo "ERROR: $LIB missing from artifacts!"
+          # Use the pre-built libwhisper_jni.so committed to the repo root
+          if [ -f "libwhisper_jni.so" ]; then
+            echo "Using pre-built libwhisper_jni.so from repo root"
+            cp libwhisper_jni.so release_assets/libwhisper_jni.so
+          else
+            echo "ERROR: libwhisper_jni.so not found in repo root!"
+            echo "Please commit your libwhisper_jni.so to the root of this repo."
+            exit 1
+          fi
+          echo "libwhisper_jni.so size: $(du -h release_assets/libwhisper_jni.so | cut -f1)"
+
+      - name: Write plugin_manifest.json
+        run: |
+          TAG=${{ github.ref_name || github.event.inputs.tag }}
+          VERSION=${TAG#lyrics-plugin-v}
+          cat > release_assets/plugin_manifest.json <<EOF
+          {
+            "version": "$VERSION",
+            "model": "base",
+            "abi": "${{ matrix.abi }}",
+            "layout": "split",
+            "libs": ["libggml-base.so", "libggml-cpu.so", "libggml.so", "libwhisper.so"]
+          }
+          EOF
+          echo "Manifest:"
+          cat release_assets/plugin_manifest.json
+
+      - name: Verify all files present before zipping
+        run: |
+          echo "release_assets contents:"
+          ls -lh release_assets/
+          REQUIRED="libggml-base.so libggml-cpu.so libggml.so libwhisper.so libwhisper_jni.so ggml-base.bin plugin_manifest.json"
+          for F in $REQUIRED; do
+            if [ ! -f "release_assets/$F" ]; then
+              echo "ERROR: release_assets/$F is missing!"
               exit 1
             fi
           done
-          echo "All required libraries present."
+          echo "All 7 required files present."
 
-      - name: Download existing release zip
+      - name: Package zip
         run: |
-          gh release download "${{ github.event.inputs.tag }}" \
-            --pattern "lyrics_plugin_v1_${{ matrix.tag_suffix }}.zip" \
-            --repo "${{ github.repository }}"
-          echo "Original zip contents:"
-          unzip -l "lyrics_plugin_v1_${{ matrix.tag_suffix }}.zip"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Inject all .so files into zip
-        run: |
-          ZIP="lyrics_plugin_v1_${{ matrix.tag_suffix }}.zip"
-          zip -j "$ZIP" \
+          ABI_TAG=${{ matrix.abi == 'arm64-v8a' && 'arm64' || 'x86_64' }}
+          cd release_assets
+          zip ../lyrics_plugin_v1_${ABI_TAG}.zip \
             libggml-base.so \
             libggml-cpu.so \
             libggml.so \
-            libwhisper.so
-          echo "Zip contents after injection:"
-          unzip -l "$ZIP"
+            libwhisper.so \
+            libwhisper_jni.so \
+            ggml-base.bin \
+            plugin_manifest.json
+          echo "Zip contents:"
+          unzip -l ../lyrics_plugin_v1_${ABI_TAG}.zip
 
-      - name: Update manifest to layout=split
-        run: |
-          ZIP="lyrics_plugin_v1_${{ matrix.tag_suffix }}.zip"
-          unzip -p "$ZIP" plugin_manifest.json > plugin_manifest.json 2>/dev/null || \
-            echo '{"version":"1.0.3","model":"base"}' > plugin_manifest.json
-          python3 - <<'EOF'
-          import json
-          with open("plugin_manifest.json") as f:
-              m = json.load(f)
-          m["layout"] = "split"
-          m["abi"] = "${{ matrix.abi }}"
-          m["libs"] = ["libggml-base.so", "libggml-cpu.so", "libggml.so", "libwhisper.so"]
-          with open("plugin_manifest.json", "w") as f:
-              json.dump(m, f, indent=2)
-          print("Updated manifest:")
-          print(json.dumps(m, indent=2))
-          EOF
-          zip -j "$ZIP" plugin_manifest.json
-          echo "Final zip contents:"
-          unzip -l "$ZIP"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-zip-${{ matrix.abi }}
+          path: lyrics_plugin_v1_*.zip
 
-      - name: Delete old zip asset from release
+  # ── Create GitHub Release ──────────────────────────────────────────────────
+  release:
+    name: Create GitHub Release
+    needs: build-native
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all zip artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: zips
+          merge-multiple: true
+
+      - name: Verify zips
         run: |
-          gh release delete-asset "${{ github.event.inputs.tag }}" \
-            "lyrics_plugin_v1_${{ matrix.tag_suffix }}.zip" \
-            --repo "${{ github.repository }}" \
-            --yes
+          echo "Zips to release:"
+          ls -lh zips/
+          for ZIP in zips/*.zip; do
+            echo ""
+            echo "Contents of $ZIP:"
+            unzip -l "$ZIP"
+          done
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name || github.event.inputs.tag }}
+          name: Lyrics Plugin ${{ github.ref_name || github.event.inputs.tag }}
+          body: |
+            ## Lyrics Plugin Release
+
+            Offline Whisper lyrics plugin for Tales music player.
+
+            ### What's included in each zip
+
+            - `libggml-base.so` — GGML base primitives
+            - `libggml-cpu.so` — GGML CPU backend
+            - `libggml.so` — GGML core
+            - `libwhisper.so` — Whisper core
+            - `libwhisper_jni.so` — JNI bridge
+            - `ggml-base.bin` — Whisper base model weights (~142 MB)
+            - `plugin_manifest.json` — version metadata
+
+            ### Installation
+
+            Downloaded automatically by the app when the user enables lyrics.
+          files: zips/*.zip
+          draft: false
+          prerelease: false
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload updated zip to release
-        run: |
-          gh release upload "${{ github.event.inputs.tag }}" \
-            "lyrics_plugin_v1_${{ matrix.tag_suffix }}.zip" \
-            --repo "${{ github.repository }}"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Verify final release assets
-        run: |
-          echo "Final release assets:"
-          gh release view "${{ github.event.inputs.tag }}" \
-            --repo "${{ github.repository }}" \
-            --json assets \
-            --jq '.assets[] | "\(.name) - \(.size) bytes"'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
