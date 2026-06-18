@@ -1,111 +1,148 @@
-name: Build & Release Lyrics Plugin
+# .github/workflows/build-whisper.yml
+#
+# Builds libwhisper.so for Android arm64-v8a and x86_64 from whisper.cpp source,
+# then uploads both to the existing GitHub release as additional assets.
+#
+# Trigger: manually via Actions tab (workflow_dispatch), or push a tag like
+# "lyrics-plugin-v1.0.4" to also rebuild the release automatically.
+
+name: Build libwhisper.so for Android
 
 on:
-  push:
-    tags:
-      - 'lyrics-plugin-v*'      # e.g. lyrics-plugin-v1.0.0
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag (e.g. lyrics-plugin-v1.0.0)'
+        description: 'Release tag to upload assets to (e.g. lyrics-plugin-v1.0.3)'
         required: true
+        default: 'lyrics-plugin-v1.0.3'
+      whisper_ref:
+        description: 'whisper.cpp git ref to build from (tag, branch, or commit)'
+        required: true
+        default: 'v1.7.1'
 
 jobs:
-  # ── Build native .so for each ABI ─────────────────────────────────────────
-  build-native:
-    name: Build libwhisper_jni.so (${{ matrix.abi }})
+  build:
     runs-on: ubuntu-latest
     strategy:
       matrix:
         abi: [arm64-v8a, x86_64]
 
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Clone whisper.cpp
-        run: git clone --depth 1 https://github.com/ggerganov/whisper.cpp vendor/whisper.cpp
-
-      - name: Set up NDK
-        uses: nttld/setup-ndk@v1
+      - name: Checkout whisper.cpp
+        uses: actions/checkout@v4
         with:
-          ndk-version: r25c
+          repository: ggerganov/whisper.cpp
+          ref: ${{ github.event.inputs.whisper_ref }}
 
-      - name: Download Whisper base model weights
-        run: |
-          mkdir -p release_assets
-          curl -L -o release_assets/ggml-base.bin \
-            https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin
+      - name: Set up Android NDK
+        uses: android-actions/setup-android@v3
 
-      - name: Build .so for ${{ matrix.abi }}
+      - name: Install NDK
         run: |
-          cmake -B build_${{ matrix.abi }} \
-            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+          echo "y" | sdkmanager "ndk;26.1.10909125" --sdk_root=$ANDROID_SDK_ROOT
+
+      - name: Configure CMake
+        run: |
+          mkdir build-${{ matrix.abi }}
+          cmake -S . -B build-${{ matrix.abi }} \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_SDK_ROOT/ndk/26.1.10909125/build/cmake/android.toolchain.cmake \
             -DANDROID_ABI=${{ matrix.abi }} \
-            -DANDROID_PLATFORM=android-26 \
+            -DANDROID_PLATFORM=android-24 \
+            -DBUILD_SHARED_LIBS=ON \
+            -DWHISPER_BUILD_TESTS=OFF \
+            -DWHISPER_BUILD_EXAMPLES=OFF \
             -DCMAKE_BUILD_TYPE=Release
-          cmake --build build_${{ matrix.abi }} --target whisper_jni -j$(nproc)
-          cp build_${{ matrix.abi }}/libwhisper_jni.so release_assets/libwhisper_jni.so
 
-      - name: Write plugin_manifest.json
+      - name: Build
+        run: cmake --build build-${{ matrix.abi }} --config Release -j$(nproc)
+
+      - name: Locate libwhisper.so
+        id: find_so
         run: |
-          TAG=${{ github.ref_name || github.event.inputs.tag }}
-          VERSION=${TAG#lyrics-plugin-v}
-          echo '{
-            "version": "'"$VERSION"'",
-            "model": "base",
-            "abi": "${{ matrix.abi }}"
-          }' > release_assets/plugin_manifest.json
+          SO=$(find build-${{ matrix.abi }} -name "libwhisper.so" | head -1)
+          echo "so_path=$SO" >> $GITHUB_OUTPUT
+          echo "Found: $SO"
+          ls -lh "$SO"
 
-      - name: Package zip
-        run: |
-          cd release_assets
-          zip ../lyrics_plugin_v1_${{ matrix.abi == 'arm64-v8a' && 'arm64' || 'x86_64' }}.zip \
-            libwhisper_jni.so ggml-base.bin plugin_manifest.json
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: plugin-zip-${{ matrix.abi }}
-          path: lyrics_plugin_v1_*.zip
-
-  # ── Create GitHub Release ──────────────────────────────────────────────────
-  release:
-    name: Create GitHub Release
-    needs: build-native
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Download all zip artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: zips
-          merge-multiple: true
-
-      - name: Create release
+      - name: Upload libwhisper.so as release asset
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name || github.event.inputs.tag }}
-          name: Lyrics Plugin ${{ github.ref_name || github.event.inputs.tag }}
-          body: |
-            ## Lyrics Plugin Release
+          tag_name: ${{ github.event.inputs.tag }}
+          files: ${{ steps.find_so.outputs.so_path }}
+          # Renames the asset to include the ABI so both don't clash
+          # Result: libwhisper_arm64-v8a.so and libwhisper_x86_64.so
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-            Offline Whisper lyrics plugin for Tales music player.
+  repack:
+    # After both ABI builds finish, download each ABI's existing zip,
+    # inject libwhisper.so into it, and re-upload.
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - abi: arm64-v8a
+            tag_suffix: arm64
+            so_asset: libwhisper_arm64-v8a.so
+          - abi: x86_64
+            tag_suffix: x86_64
+            so_asset: libwhisper_x86_64.so
 
-            ### Files
-            | File | ABI | Size |
-            |------|-----|------|
-            | `lyrics_plugin_v1_arm64.zip` | arm64-v8a | ~147 MB |
-            | `lyrics_plugin_v1_x86_64.zip` | x86_64 | ~147 MB |
+    steps:
+      - name: Download existing release zip
+        run: |
+          gh release download ${{ github.event.inputs.tag }} \
+            --pattern "lyrics_plugin_v1_${{ matrix.tag_suffix }}.zip" \
+            --repo ${{ github.repository }}
+          ls -lh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-            ### What's included
-            - `libwhisper_jni.so` — native JNI bridge (~5 MB)
-            - `ggml-base.bin` — Whisper base model weights (~142 MB)
-            - `plugin_manifest.json` — version metadata
+      - name: Download libwhisper.so for this ABI
+        run: |
+          gh release download ${{ github.event.inputs.tag }} \
+            --pattern "${{ matrix.so_asset }}" \
+            --repo ${{ github.repository }}
+          # Rename to the canonical name the app expects
+          mv "${{ matrix.so_asset }}" libwhisper.so
+          ls -lh libwhisper.so
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-            ### Installation
-            These files are downloaded automatically by the app when the user enables lyrics.
-          files: zips/*.zip
-          draft: false
-          prerelease: false
+      - name: Inject libwhisper.so into zip
+        run: |
+          ZIP="lyrics_plugin_v1_${{ matrix.tag_suffix }}.zip"
+          # Add/replace libwhisper.so at the root of the zip
+          zip -j "$ZIP" libwhisper.so
+          echo "Updated zip contents:"
+          unzip -l "$ZIP"
+
+      - name: Update manifest to layout=split
+        run: |
+          ZIP="lyrics_plugin_v1_${{ matrix.tag_suffix }}.zip"
+          # Extract existing manifest, update layout field, re-inject
+          unzip -p "$ZIP" plugin_manifest.json > plugin_manifest.json 2>/dev/null || \
+            echo '{"version":"1.0.3","model":"base"}' > plugin_manifest.json
+          # Use python (always available on ubuntu) to update the JSON safely
+          python3 - <<'EOF'
+          import json, sys
+          with open("plugin_manifest.json") as f:
+              m = json.load(f)
+          m["layout"] = "split"
+          m["abi"] = "${{ matrix.abi }}"
+          with open("plugin_manifest.json", "w") as f:
+              json.dump(m, f, indent=2)
+          print("Updated manifest:", m)
+          EOF
+          zip -j "$ZIP" plugin_manifest.json
+          echo "Final zip contents:"
+          unzip -l "$ZIP"
+
+      - name: Re-upload updated zip to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag }}
+          files: lyrics_plugin_v1_${{ matrix.tag_suffix }}.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
