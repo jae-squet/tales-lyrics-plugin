@@ -215,7 +215,6 @@ Java_com_squet_talesplayer_WhisperPlugin_nativeTranscribe(
     wparams.single_segment       = false;
     wparams.max_tokens           = 0;
     wparams.token_timestamps     = true;
-    wparams.dtw_token_timestamps = true;
 
     // ── Progress callback ─────────────────────────────────────────────────────
     ProgressCallbackData cbData;
