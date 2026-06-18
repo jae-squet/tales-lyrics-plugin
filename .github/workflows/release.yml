@@ -1,10 +1,14 @@
 # .github/workflows/build-whisper.yml
 #
-# Builds libwhisper.so for Android arm64-v8a and x86_64 from whisper.cpp source,
-# then uploads both to the existing GitHub release as additional assets.
+# Builds all required native libraries for Android from whisper.cpp source:
+#   - libggml-base.so
+#   - libggml-cpu.so
+#   - libggml.so
+#   - libwhisper.so
 #
-# Trigger: manually via Actions tab (workflow_dispatch), or push a tag like
-# "lyrics-plugin-v1.0.4" to also rebuild the release automatically.
+# Then injects them into the existing release zips alongside libwhisper_jni.so.
+# Load order in WhisperPlugin.kt must be:
+#   libggml-base.so → libggml-cpu.so → libggml.so → libwhisper.so → libwhisper_jni.so
 
 name: Build libwhisper.so for Android
 
@@ -34,7 +38,7 @@ jobs:
           repository: ggerganov/whisper.cpp
           ref: ${{ github.event.inputs.whisper_ref }}
 
-      - name: Set up Android NDK
+      - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
       - name: Install NDK
@@ -56,27 +60,46 @@ jobs:
       - name: Build
         run: cmake --build build-${{ matrix.abi }} --config Release -j$(nproc)
 
-      - name: Locate libwhisper.so
-        id: find_so
+      - name: List all built .so files
         run: |
-          SO=$(find build-${{ matrix.abi }} -name "libwhisper.so" | head -1)
-          echo "so_path=$SO" >> $GITHUB_OUTPUT
-          echo "Found: $SO"
-          ls -lh "$SO"
+          echo "All .so files produced:"
+          find build-${{ matrix.abi }} -name "*.so" | sort
+          echo ""
+          echo "Sizes:"
+          find build-${{ matrix.abi }} -name "*.so" -exec ls -lh {} \;
 
-      - name: Upload libwhisper.so as release asset
-        uses: softprops/action-gh-release@v2
+      - name: Collect all required .so files
+        run: |
+          REQUIRED="libggml-base.so libggml-cpu.so libggml.so libwhisper.so"
+          ALL_FOUND=true
+          for LIB in $REQUIRED; do
+            SO=$(find build-${{ matrix.abi }} -name "$LIB" | head -1)
+            if [ -z "$SO" ]; then
+              echo "ERROR: $LIB not found in build output!"
+              ALL_FOUND=false
+            else
+              echo "Found $LIB at $SO ($(du -h $SO | cut -f1))"
+              cp "$SO" "$LIB"
+            fi
+          done
+          if [ "$ALL_FOUND" = false ]; then
+            echo ""
+            echo "Build output was:"
+            find build-${{ matrix.abi }} -name "*.so"
+            exit 1
+          fi
+
+      - name: Upload all .so files as artifact
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: ${{ github.event.inputs.tag }}
-          files: ${{ steps.find_so.outputs.so_path }}
-          # Renames the asset to include the ABI so both don't clash
-          # Result: libwhisper_arm64-v8a.so and libwhisper_x86_64.so
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: whisper-libs-${{ matrix.abi }}
+          path: |
+            libggml-base.so
+            libggml-cpu.so
+            libggml.so
+            libwhisper.so
 
   repack:
-    # After both ABI builds finish, download each ABI's existing zip,
-    # inject libwhisper.so into it, and re-upload.
     needs: build
     runs-on: ubuntu-latest
     strategy:
@@ -84,65 +107,93 @@ jobs:
         include:
           - abi: arm64-v8a
             tag_suffix: arm64
-            so_asset: libwhisper_arm64-v8a.so
           - abi: x86_64
             tag_suffix: x86_64
-            so_asset: libwhisper_x86_64.so
 
     steps:
+      - name: Download built .so artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: whisper-libs-${{ matrix.abi }}
+
+      - name: Verify downloaded .so files
+        run: |
+          echo "Downloaded libraries:"
+          ls -lh *.so
+          REQUIRED="libggml-base.so libggml-cpu.so libggml.so libwhisper.so"
+          for LIB in $REQUIRED; do
+            if [ ! -f "$LIB" ]; then
+              echo "ERROR: $LIB missing from artifacts!"
+              exit 1
+            fi
+          done
+          echo "All required libraries present."
+
       - name: Download existing release zip
         run: |
-          gh release download ${{ github.event.inputs.tag }} \
+          gh release download "${{ github.event.inputs.tag }}" \
             --pattern "lyrics_plugin_v1_${{ matrix.tag_suffix }}.zip" \
-            --repo ${{ github.repository }}
-          ls -lh
+            --repo "${{ github.repository }}"
+          echo "Original zip contents:"
+          unzip -l "lyrics_plugin_v1_${{ matrix.tag_suffix }}.zip"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Download libwhisper.so for this ABI
-        run: |
-          gh release download ${{ github.event.inputs.tag }} \
-            --pattern "${{ matrix.so_asset }}" \
-            --repo ${{ github.repository }}
-          # Rename to the canonical name the app expects
-          mv "${{ matrix.so_asset }}" libwhisper.so
-          ls -lh libwhisper.so
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Inject libwhisper.so into zip
+      - name: Inject all .so files into zip
         run: |
           ZIP="lyrics_plugin_v1_${{ matrix.tag_suffix }}.zip"
-          # Add/replace libwhisper.so at the root of the zip
-          zip -j "$ZIP" libwhisper.so
-          echo "Updated zip contents:"
+          zip -j "$ZIP" \
+            libggml-base.so \
+            libggml-cpu.so \
+            libggml.so \
+            libwhisper.so
+          echo "Zip contents after injection:"
           unzip -l "$ZIP"
 
       - name: Update manifest to layout=split
         run: |
           ZIP="lyrics_plugin_v1_${{ matrix.tag_suffix }}.zip"
-          # Extract existing manifest, update layout field, re-inject
           unzip -p "$ZIP" plugin_manifest.json > plugin_manifest.json 2>/dev/null || \
             echo '{"version":"1.0.3","model":"base"}' > plugin_manifest.json
-          # Use python (always available on ubuntu) to update the JSON safely
           python3 - <<'EOF'
-          import json, sys
+          import json
           with open("plugin_manifest.json") as f:
               m = json.load(f)
           m["layout"] = "split"
           m["abi"] = "${{ matrix.abi }}"
+          m["libs"] = ["libggml-base.so", "libggml-cpu.so", "libggml.so", "libwhisper.so"]
           with open("plugin_manifest.json", "w") as f:
               json.dump(m, f, indent=2)
-          print("Updated manifest:", m)
+          print("Updated manifest:")
+          print(json.dumps(m, indent=2))
           EOF
           zip -j "$ZIP" plugin_manifest.json
           echo "Final zip contents:"
           unzip -l "$ZIP"
 
-      - name: Re-upload updated zip to release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.event.inputs.tag }}
-          files: lyrics_plugin_v1_${{ matrix.tag_suffix }}.zip
+      - name: Delete old zip asset from release
+        run: |
+          gh release delete-asset "${{ github.event.inputs.tag }}" \
+            "lyrics_plugin_v1_${{ matrix.tag_suffix }}.zip" \
+            --repo "${{ github.repository }}" \
+            --yes
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload updated zip to release
+        run: |
+          gh release upload "${{ github.event.inputs.tag }}" \
+            "lyrics_plugin_v1_${{ matrix.tag_suffix }}.zip" \
+            --repo "${{ github.repository }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify final release assets
+        run: |
+          echo "Final release assets:"
+          gh release view "${{ github.event.inputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --json assets \
+            --jq '.assets[] | "\(.name) - \(.size) bytes"'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
